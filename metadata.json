@@ -1,0 +1,6 @@
+{
+  "name": "ATRIX Terminal Toolkit",
+  "description": "A fully functional web terminal with real developer tools, network diagnostics, virtual filesystem, in-terminal editor, and system utilities.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
