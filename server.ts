@@ -9,18 +9,247 @@ import net from 'net';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
 
-dotenv.config();
+dotenv.config({ quiet: true });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const isProd = process.env.NODE_ENV === 'production';
 const PORT = process.env.PORT || 3000;
 
-const app = express();
+export const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // --- API Endpoints for Real Working Tools ---
+
+function isPrivateOrBogonIp(ip: string): boolean {
+  if (!ip) return true;
+  const clean = ip.replace(/^::ffff:/i, '').trim();
+  if (clean === '::1' || clean === 'localhost') return true;
+  if (/^(10\.|127\.|169\.254\.|192\.168\.|0\.)/.test(clean)) return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(clean)) return true;
+  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(clean)) return true; // CGNAT 100.64.0.0/10
+  if (/^(fc|fd|fe80:)/i.test(clean)) return true; // IPv6 ULA / link-local
+  return false;
+}
+
+async function fetchJsonSafe(url: string, timeoutMs = 3500): Promise<any | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'ATRIX-GeoIP-Engine/2.0',
+        'Accept': 'application/json'
+      }
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveDeepIpGeo(rawIp?: string) {
+  const cleanIp = rawIp ? rawIp.replace(/^::ffff:/i, '').trim() : '';
+  const isBogon = cleanIp ? isPrivateOrBogonIp(cleanIp) : false;
+
+  if (cleanIp && isBogon) {
+    return {
+      ip: cleanIp,
+      ipVersion: net.isIPv6(cleanIp) ? 'IPv6' : 'IPv4',
+      isBogon: true,
+      continent: 'Local / Private Network',
+      country: 'Private Network (RFC 1918 / Loopback)',
+      country_code: 'LAN',
+      region: 'Internal Routing',
+      city: 'Localhost / LAN',
+      postal: 'N/A',
+      org: 'Private / Non-Routable IP Block',
+      isp: 'Internal Network',
+      asn: 'N/A',
+      bgpPrefix: 'Private CIDR',
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+      latitude: undefined as number | undefined,
+      longitude: undefined as number | undefined,
+      networkType: 'Private / Internal Network',
+      securityFlags: { isProxy: false, isHosting: false, isMobile: false, isAnycast: false, isBogon: true },
+      consensus: 'Local RFC 1918 / Loopback address',
+      providersUsed: ['Local Validator'],
+      providerBreakdown: [] as { provider: string; city: string; country: string; org: string }[],
+      reverseDns: [] as string[]
+    };
+  }
+
+  // Empty cleanIp -> auto-detect server/egress public IP; otherwise query target IP across 5 live engines in parallel
+  const ipApiUrl = cleanIp
+    ? `http://ip-api.com/json/${encodeURIComponent(cleanIp)}?fields=status,message,continent,continentCode,country,countryCode,region,regionName,city,zip,lat,lon,timezone,offset,isp,org,as,asname,reverse,mobile,proxy,hosting,query`
+    : 'http://ip-api.com/json/?fields=status,message,continent,continentCode,country,countryCode,region,regionName,city,zip,lat,lon,timezone,offset,isp,org,as,asname,reverse,mobile,proxy,hosting,query';
+  const ipWhoUrl = cleanIp ? `https://ipwho.is/${encodeURIComponent(cleanIp)}` : 'https://ipwho.is/';
+  const ipInfoUrl = cleanIp ? `https://ipinfo.io/${encodeURIComponent(cleanIp)}/json` : 'https://ipinfo.io/json';
+  const ipApiCoUrl = cleanIp ? `https://ipapi.co/${encodeURIComponent(cleanIp)}/json/` : 'https://ipapi.co/json/';
+  const ripeUrl = cleanIp ? `https://stat.ripe.net/data/network-info/data.json?resource=${encodeURIComponent(cleanIp)}` : '';
+
+  const [ipApiRes, ipWhoRes, ipInfoRes, ipApiCoRes, ripeRes] = await Promise.all([
+    fetchJsonSafe(ipApiUrl, 3500),
+    fetchJsonSafe(ipWhoUrl, 3500),
+    fetchJsonSafe(ipInfoUrl, 3500),
+    fetchJsonSafe(ipApiCoUrl, 2500),
+    ripeUrl ? fetchJsonSafe(ripeUrl, 3200) : Promise.resolve(null)
+  ]);
+
+  const ipApi = ipApiRes?.status === 'success' ? ipApiRes : null;
+  const ipWho = ipWhoRes?.success === true ? ipWhoRes : null;
+  const ipInfo = ipInfoRes?.ip && !ipInfoRes?.error ? ipInfoRes : null;
+  const ipApiCo = ipApiCoRes?.ip && !ipApiCoRes?.error ? ipApiCoRes : null;
+  const ripeData = ripeRes?.status === 'ok' && ripeRes?.data ? ripeRes.data : null;
+
+  const detectedIp = cleanIp || ipApi?.query || ipWho?.ip || ipInfo?.ip || ipApiCo?.ip || '127.0.0.1';
+
+  // Parse ipinfo loc ("lat,lon")
+  let infoLat: number | undefined;
+  let infoLon: number | undefined;
+  if (typeof ipInfo?.loc === 'string' && ipInfo.loc.includes(',')) {
+    const [la, lo] = ipInfo.loc.split(',').map((s: string) => parseFloat(s.trim()));
+    if (Number.isFinite(la) && Number.isFinite(lo)) {
+      infoLat = la;
+      infoLon = lo;
+    }
+  }
+
+  // Extract ASN cleanly
+  let asn = 'N/A';
+  if (ipApi?.as) {
+    asn = String(ipApi.as).split(' ')[0];
+  } else if (ipWho?.connection?.asn) {
+    asn = `AS${ipWho.connection.asn}`;
+  } else if (ipInfo?.org && /^AS\d+/i.test(ipInfo.org)) {
+    asn = ipInfo.org.split(' ')[0];
+  } else if (ipApiCo?.asn) {
+    asn = String(ipApiCo.asn);
+  } else if (Array.isArray(ripeData?.asns) && ripeData.asns.length > 0) {
+    asn = `AS${ripeData.asns[0]}`;
+  }
+
+  const city = ipApi?.city || ipWho?.city || ipInfo?.city || ipApiCo?.city || 'Unknown';
+  const region = ipApi?.regionName || ipWho?.region || ipInfo?.region || ipApiCo?.region || 'Unknown';
+  const country = ipApi?.country || ipWho?.country || ipApiCo?.country_name || ipInfo?.country || 'Unknown';
+  const country_code = ipApi?.countryCode || ipWho?.country_code || ipInfo?.country || ipApiCo?.country_code || 'N/A';
+  const continent = ipApi?.continent || ipWho?.continent || ipApiCo?.continent_code || 'Unknown';
+  const postal = ipApi?.zip || ipWho?.postal || ipInfo?.postal || ipApiCo?.postal || 'N/A';
+  const isp = ipApi?.isp || ipWho?.connection?.isp || ipApiCo?.org || 'ISP Network';
+  const org = ipApi?.org || ipWho?.connection?.org || (ipInfo?.org ? ipInfo.org.replace(/^AS\d+\s+/i, '') : '') || ipApiCo?.org || isp;
+  const timezone = ipApi?.timezone || ipWho?.timezone?.id || ipInfo?.timezone || ipApiCo?.timezone || 'UTC';
+  const latitude: number | undefined = ipApi?.lat ?? ipWho?.latitude ?? infoLat ?? ipApiCo?.latitude;
+  const longitude: number | undefined = ipApi?.lon ?? ipWho?.longitude ?? infoLon ?? ipApiCo?.longitude;
+  const bgpPrefix: string = ripeData?.prefix || 'N/A';
+
+  const isAnycast = Boolean(ipInfo?.anycast);
+  const isProxy = Boolean(ipApi?.proxy);
+  const orgLower = `${isp} ${org}`.toLowerCase();
+  const isHosting = Boolean(ipApi?.hosting) || /cloud|hosting|datacenter|amazon|aws|google|microsoft|azure|digitalocean|linode|vultr|ovh|hetzner|cloudflare|akamai|fastly/i.test(orgLower);
+  const isMobile = Boolean(ipApi?.mobile);
+
+  let networkType = 'Residential / Business ISP';
+  if (isAnycast) networkType = 'Anycast / Global Edge / CDN';
+  else if (isProxy) networkType = 'Proxy / VPN / Anonymizer Exit';
+  else if (isHosting) networkType = 'Hosting / Cloud / Datacenter';
+  else if (isMobile) networkType = 'Mobile Cellular Carrier';
+
+  const providerBreakdown: { provider: string; city: string; country: string; org: string }[] = [];
+  const providersUsed: string[] = [];
+  if (ipApi) {
+    providersUsed.push('ip-api.com');
+    providerBreakdown.push({ provider: 'ip-api', city: ipApi.city || 'N/A', country: ipApi.countryCode || 'N/A', org: ipApi.isp || ipApi.org || 'N/A' });
+  }
+  if (ipWho) {
+    providersUsed.push('ipwho.is');
+    providerBreakdown.push({ provider: 'ipwho.is', city: ipWho.city || 'N/A', country: ipWho.country_code || 'N/A', org: ipWho.connection?.isp || ipWho.connection?.org || 'N/A' });
+  }
+  if (ipInfo) {
+    providersUsed.push('ipinfo.io');
+    providerBreakdown.push({ provider: 'ipinfo.io', city: ipInfo.city || 'N/A', country: ipInfo.country || 'N/A', org: ipInfo.org || 'N/A' });
+  }
+  if (ipApiCo) {
+    providersUsed.push('ipapi.co');
+    providerBreakdown.push({ provider: 'ipapi.co', city: ipApiCo.city || 'N/A', country: ipApiCo.country_code || 'N/A', org: ipApiCo.org || 'N/A' });
+  }
+  if (ripeData) {
+    providersUsed.push('RIPE Stat BGP');
+  }
+
+  // Cross-provider consensus calculation
+  const geoCountries = providerBreakdown.map(p => p.country.toUpperCase()).filter(c => c && c !== 'N/A');
+  const geoCities = providerBreakdown.map(p => p.city.toLowerCase()).filter(c => c && c !== 'n/a' && c !== 'unknown');
+  const uniqueCountries = new Set(geoCountries);
+  const uniqueCities = new Set(geoCities);
+
+  let consensus = 'Single/Fallback Source';
+  if (providerBreakdown.length >= 2) {
+    if (uniqueCountries.size === 1 && uniqueCities.size === 1) {
+      consensus = `High Confidence (${providerBreakdown.length}/${providerBreakdown.length} GeoIP providers match city & country)`;
+    } else if (uniqueCountries.size === 1) {
+      consensus = isAnycast
+        ? `Anycast Multi-PoP (${providerBreakdown.length} providers agree on ${country}; PoP cities vary)`
+        : `Country Verified (${providerBreakdown.length}/${providerBreakdown.length} agree on ${country}; city varies across PoPs)`;
+    } else {
+      consensus = `Multi-Region Variance (${Array.from(uniqueCountries).join(' / ')})`;
+    }
+  }
+
+  let reverseDns: string[] = [];
+  try {
+    if (detectedIp && !isPrivateOrBogonIp(detectedIp)) {
+      reverseDns = await dns.reverse(detectedIp);
+    }
+  } catch {}
+  if (reverseDns.length === 0 && ipInfo?.hostname) {
+    reverseDns = [ipInfo.hostname];
+  } else if (reverseDns.length === 0 && ipApi?.reverse) {
+    reverseDns = [ipApi.reverse];
+  }
+
+  const hasCoords = typeof latitude === 'number' && typeof longitude === 'number';
+  const osmUrl = hasCoords ? `https://www.openstreetmap.org/?mlat=${latitude}&mlon=${longitude}#map=11/${latitude}/${longitude}` : undefined;
+  const mapsUrl = hasCoords ? `https://maps.google.com/?q=${latitude},${longitude}` : undefined;
+
+  return {
+    ip: detectedIp,
+    ipVersion: net.isIPv6(detectedIp) ? 'IPv6' : 'IPv4',
+    isBogon: false,
+    continent,
+    country,
+    country_code,
+    region,
+    city,
+    postal,
+    isp,
+    org,
+    asn,
+    bgpPrefix,
+    timezone,
+    latitude,
+    longitude,
+    coordinates: hasCoords ? `${latitude}, ${longitude}` : undefined,
+    osmUrl,
+    mapsUrl,
+    networkType,
+    securityFlags: {
+      isProxy,
+      isHosting,
+      isMobile,
+      isAnycast,
+      isBogon: false
+    },
+    consensus,
+    providersUsed,
+    providerBreakdown,
+    reverseDns
+  };
+}
 
 // 1. IP and Network Details (Supports client self-inspection or target domain/IP query)
 app.all('/api/ip', async (req, res) => {
@@ -28,74 +257,58 @@ app.all('/api/ip', async (req, res) => {
     const queryTarget = (req.query.target as string) || (req.body?.target as string) || '';
     let targetIp = '';
     let isRemoteTarget = false;
+    let resolvedAddresses: string[] = [];
 
     if (queryTarget) {
       isRemoteTarget = true;
-      const cleanTarget = queryTarget.replace(/^https?:\/\//, '').split('/')[0].split(':')[0].trim();
-      if (/^(\d{1,3}\.){3}\d{1,3}$/.test(cleanTarget)) {
-        targetIp = cleanTarget;
+      const cleanTarget = queryTarget.replace(/^https?:\/\//, '').split('/')[0].split('?')[0].trim();
+      const hostOnly = cleanTarget.startsWith('[')
+        ? cleanTarget.slice(1, cleanTarget.indexOf(']'))
+        : (net.isIP(cleanTarget) ? cleanTarget : cleanTarget.split(':')[0]);
+
+      if (net.isIP(hostOnly)) {
+        targetIp = hostOnly;
+        resolvedAddresses = [hostOnly];
       } else {
-        try {
-          const resolved = await dns.lookup(cleanTarget);
-          targetIp = resolved.address;
-        } catch {
-          targetIp = cleanTarget;
+        const [v4, v6] = await Promise.all([
+          dns.resolve4(hostOnly).catch(() => [] as string[]),
+          dns.resolve6(hostOnly).catch(() => [] as string[])
+        ]);
+        resolvedAddresses = [...v4, ...v6];
+        if (resolvedAddresses.length > 0) {
+          targetIp = resolvedAddresses[0];
+        } else {
+          const fallback = await dns.lookup(hostOnly).catch(() => null);
+          if (!fallback) {
+            return res.status(404).json({ error: `Host '${hostOnly}' tidak dapat di-resolve ke alamat IP.` });
+          }
+          targetIp = fallback.address;
+          resolvedAddresses = [fallback.address];
         }
       }
     }
 
-    let clientIp = '';
-    if (!targetIp) {
+    let queryIp = targetIp;
+    if (!isRemoteTarget) {
       const forwarded = req.headers['x-forwarded-for'];
-      clientIp = typeof forwarded === 'string' ? forwarded.split(',')[0].trim() : req.socket.remoteAddress || '127.0.0.1';
-    }
-
-    const ipToQuery = targetIp || clientIp;
-
-    // Fetch external IP info with timeout
-    let publicInfo: any = {};
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3000);
-      const queryUrl = targetIp ? `https://ipapi.co/${targetIp}/json/` : 'https://ipapi.co/json/';
-      const ipRes = await fetch(queryUrl, { signal: controller.signal });
-      clearTimeout(timeoutId);
-      if (ipRes.ok) {
-        publicInfo = await ipRes.json();
+      const clientIp = typeof forwarded === 'string' ? forwarded.split(',')[0].trim() : req.socket.remoteAddress || '';
+      // Only pass clientIp to external GeoIP providers if it's a real public IP (not localhost/internal)
+      if (clientIp && !isPrivateOrBogonIp(clientIp)) {
+        queryIp = clientIp.replace(/^::ffff:/i, '');
       }
-    } catch {
-      // fallback if external rate-limited
     }
 
-    // Reverse DNS lookup for the investigated IP
-    let reverseDns: string[] = [];
-    const finalIp = publicInfo.ip || ipToQuery;
-    try {
-      if (finalIp && finalIp !== '127.0.0.1') {
-        reverseDns = await dns.reverse(finalIp);
-      }
-    } catch {
-      // ignore rdns fallback
-    }
+    const geo = await resolveDeepIpGeo(queryIp || undefined);
 
     res.json({
-      ip: finalIp,
+      ...geo,
       target: queryTarget || undefined,
       isRemoteTarget,
-      city: publicInfo.city || 'Unknown',
-      region: publicInfo.region || 'Unknown',
-      country: publicInfo.country_name || 'Unknown',
-      country_code: publicInfo.country_code || 'ID',
-      org: publicInfo.org || 'ISP Network',
-      asn: publicInfo.asn || 'N/A',
-      latitude: publicInfo.latitude || undefined,
-      longitude: publicInfo.longitude || undefined,
-      timezone: publicInfo.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone,
-      reverseDns,
+      resolvedAddresses: resolvedAddresses.length > 0 ? resolvedAddresses : [geo.ip],
       userAgent: req.headers['user-agent'] || 'Unknown'
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to detect IP' });
+    res.status(500).json({ error: err.message || 'Failed to detect IP geolocation' });
   }
 });
 
@@ -510,6 +723,25 @@ app.post('/api/security/urlscan', async (req, res) => {
           }
         } catch {}
       }
+      if (/<[a-z!/][^>]*>/i.test(v) || /(?:javascript|vbscript):|data:text\/html/i.test(v) || /\bon(?:error|load|click|mouseover|focus)\s*=/i.test(v)) {
+        riskScore += 30;
+        findings.push({
+          severity: 'HIGH',
+          category: 'HTML/XSS Lure in URL',
+          title: `Potensi Indikasi HTML Injection / Reflected XSS di Parameter ('${k}')`,
+          detail: 'Nilai parameter URL mengandung fragmen tag HTML, event handler, atau skema javascript:/data:. Tautan ini mencurigakan dan berisiko menjadi umpan XSS.'
+        });
+      }
+    }
+
+    if (initialUrl.hash && (/<[a-z!/][^>]*>/i.test(decodeURIComponent(initialUrl.hash)) || /(?:javascript|vbscript):/i.test(initialUrl.hash))) {
+      riskScore += 25;
+      findings.push({
+        severity: 'HIGH',
+        category: 'DOM XSS Lure in Fragment',
+        title: 'Fragmen Hash (#) URL Mengandung Fragmen HTML/Script',
+        detail: 'Hash URL berisi pola tag HTML atau skema javascript: yang sering muncul pada tautan umpan DOM XSS.'
+      });
     }
 
     // Check dangerous file extensions in pathname
@@ -748,17 +980,29 @@ app.post('/api/security/urlscan', async (req, res) => {
       const headers = finalResponse.headers;
       const contentType = headers.get('content-type') || 'unknown';
       const serverHeader = headers.get('server') || 'Hidden';
+      const cspHeader = headers.get('content-security-policy') || '';
       const hasHsts = Boolean(headers.get('strict-transport-security'));
-      const hasCsp = Boolean(headers.get('content-security-policy'));
+      const hasCsp = Boolean(cspHeader);
       const hasXfo = Boolean(headers.get('x-frame-options'));
-      const hasXcto = Boolean(headers.get('x-content-type-options'));
+      const xctoVal = (headers.get('x-content-type-options') || '').toLowerCase();
+      const hasXcto = xctoVal.includes('nosniff');
+
+      const cspUnsafeInline = /'unsafe-inline'/i.test(cspHeader);
+      const cspUnsafeEval = /'unsafe-eval'/i.test(cspHeader);
+      const cspWildcard = /(?:script-src|default-src)[^;]*\*/i.test(cspHeader);
 
       httpInfo = {
         status: finalResponse.status,
         statusText: finalResponse.statusText,
         contentType,
         server: serverHeader,
-        securityHeaders: { hasHsts, hasCsp, hasXfo, hasXcto }
+        securityHeaders: { hasHsts, hasCsp, hasXfo, hasXcto },
+        cspAudit: {
+          present: hasCsp,
+          unsafeInline: cspUnsafeInline,
+          unsafeEval: cspUnsafeEval,
+          wildcard: cspWildcard
+        }
       };
 
       if (finalResponse.status >= 400) {
@@ -779,12 +1023,43 @@ app.post('/api/security/urlscan', async (req, res) => {
           detail: 'Strict-Transport-Security belum dipasang.'
         });
       }
+      if (!hasCsp) {
+        riskScore += 10;
+        findings.push({
+          severity: 'MEDIUM',
+          category: 'XSS Defense (CSP)',
+          title: 'Header Content-Security-Policy (CSP) Tidak Ditemukan',
+          detail: 'Tanpa CSP, browser tidak memiliki lapisan mitigasi tambahan bila terjadi celah HTML Injection atau XSS di aplikasi.'
+        });
+      } else if (cspUnsafeInline || cspUnsafeEval || cspWildcard) {
+        riskScore += 10;
+        const weakFlags = [
+          cspUnsafeInline ? "'unsafe-inline'" : null,
+          cspUnsafeEval ? "'unsafe-eval'" : null,
+          cspWildcard ? 'wildcard (*)' : null
+        ].filter(Boolean).join(', ');
+        findings.push({
+          severity: 'MEDIUM',
+          category: 'XSS Defense (CSP)',
+          title: `Konfigurasi CSP Lemah (${weakFlags})`,
+          detail: `Policy CSP mengizinkan ${weakFlags}, sehingga efektivitas pencegahan eksekusi skrip injeksi berkurang drastis.`
+        });
+      }
+      if (!hasXcto) {
+        riskScore += 5;
+        findings.push({
+          severity: 'LOW',
+          category: 'MIME Sniffing / XSS',
+          title: 'Header X-Content-Type-Options: nosniff Tidak Aktif',
+          detail: 'Tanpa nosniff, browser berisiko menafsirkan file non-HTML sebagai HTML/JavaScript aktif (MIME confusion).'
+        });
+      }
       if (!hasCsp && !hasXfo) {
         riskScore += 5;
         findings.push({
           severity: 'LOW',
           category: 'Security Header',
-          title: 'Proteksi Clickjacking / XSS (CSP & X-Frame-Options) Lemah',
+          title: 'Proteksi Clickjacking (CSP frame-ancestors & X-Frame-Options) Lemah',
           detail: 'Situs tidak mengirim CSP maupun X-Frame-Options.'
         });
       }
@@ -801,6 +1076,18 @@ app.post('/api/security/urlscan', async (req, res) => {
           const hasMetaRefresh = /<meta[^>]+http-equiv=["']?refresh["']?[^>]+url=/i.test(html);
           const hiddenIframe = /<iframe[^>]+(display:\s*none|visibility:\s*hidden|width=["']?0["']?|height=["']?0["']?)/i.test(html);
           const obfuscatedJs = /eval\s*\(\s*atob\s*\(|document\.write\s*\(\s*unescape\s*\(/i.test(html);
+
+          // Passive HTML Injection & DOM XSS surface inspection (no payload execution)
+          const inlineEventHandlers = (html.match(/\son(?:error|load|click|mouseover|mouseenter|focus|blur|submit|input|change)\s*=\s*["']/gi) || []).length;
+          const jsPseudoUriCount = (html.match(/(?:href|src|action)\s*=\s*["']\s*javascript:/gi) || []).length;
+          const domSinkMatches: string[] = [];
+          if (/\.innerHTML\s*=/i.test(html)) domSinkMatches.push('innerHTML');
+          if (/\.outerHTML\s*=/i.test(html)) domSinkMatches.push('outerHTML');
+          if (/document\.write(?:ln)?\s*\(/i.test(html)) domSinkMatches.push('document.write');
+          if (/\.insertAdjacentHTML\s*\(/i.test(html)) domSinkMatches.push('insertAdjacentHTML');
+          if (/\beval\s*\(/i.test(html)) domSinkMatches.push('eval()');
+          if (/new\s+Function\s*\(/i.test(html)) domSinkMatches.push('new Function()');
+          const unsandboxedIframes = (html.match(/<iframe(?![^>]*\bsandbox\b)[^>]*>/gi) || []).length;
 
           // Check external form action
           let externalFormAction: string | null = null;
@@ -824,7 +1111,13 @@ app.post('/api/security/urlscan', async (req, res) => {
             hasMetaRefresh,
             hiddenIframe,
             obfuscatedJs,
-            externalFormAction
+            externalFormAction,
+            xssSurface: {
+              inlineEventHandlers,
+              jsPseudoUriCount,
+              domSinks: domSinkMatches,
+              unsandboxedIframes
+            }
           };
 
           if (hasPasswordField && finalParsed.protocol === 'http:') {
@@ -867,6 +1160,45 @@ app.post('/api/security/urlscan', async (req, res) => {
             });
           }
 
+          if (jsPseudoUriCount > 0) {
+            riskScore += 15;
+            findings.push({
+              severity: 'MEDIUM',
+              category: 'XSS Surface (HTML)',
+              title: `Ditemukan ${jsPseudoUriCount} Tautan Skema 'javascript:' di HTML`,
+              detail: 'Penggunaan URL javascript: di atribut href/src/action meningkatkan permukaan risiko injeksi HTML/XSS dan diblokir oleh CSP modern.'
+            });
+          }
+
+          if (domSinkMatches.length > 0) {
+            riskScore += 10;
+            findings.push({
+              severity: 'LOW',
+              category: 'DOM XSS Sink Audit',
+              title: `Terdeteksi DOM Sink Berisiko di Halaman (${domSinkMatches.join(', ')})`,
+              detail: 'Jika input pengguna masuk ke sink DOM tersebut tanpa sanitasi (misal DOMPurify) atau textContent, aplikasi berisiko mengalami DOM-based HTML Injection / XSS.'
+            });
+          }
+
+          if (inlineEventHandlers > 0 && (!hasCsp || cspUnsafeInline)) {
+            riskScore += 5;
+            findings.push({
+              severity: 'INFO',
+              category: 'HTML / CSP Hygiene',
+              title: `Terdapat ${inlineEventHandlers} Inline Event Handler HTML Tanpa Strict CSP`,
+              detail: 'Atribut event inline (onload/onclick/dll) menyulitkan penerapan CSP ketat berbasis nonce/hash.'
+            });
+          }
+
+          if (unsandboxedIframes > 0) {
+            findings.push({
+              severity: 'INFO',
+              category: 'HTML Hardening',
+              title: `Ditemukan ${unsandboxedIframes} Elemen <iframe> Tanpa Atribut sandbox`,
+              detail: 'Tambahkan atribut sandbox pada iframe pihak ketiga untuk membatasi akses skrip dan navigasi top-level.'
+            });
+          }
+
           if (hasMetaRefresh) {
             riskScore += 10;
             findings.push({
@@ -906,6 +1238,9 @@ app.post('/api/security/urlscan', async (req, res) => {
 
     if (finalParsed.protocol === 'http:') {
       recommendations.push('Aktifkan HTTPS (SSL/TLS) dan paksa redirect dari HTTP ke HTTPS.');
+    }
+    if (!httpInfo?.securityHeaders?.hasCsp || httpInfo?.cspAudit?.unsafeInline || httpInfo?.cspAudit?.unsafeEval) {
+      recommendations.push("Terapkan Content-Security-Policy (CSP) ketat dengan nonce/hash tanpa 'unsafe-inline' atau 'unsafe-eval', serta gunakan contextual HTML encoding / DOMPurify untuk mencegah HTML Injection & XSS.");
     }
 
     res.json({
@@ -1292,23 +1627,17 @@ app.post('/api/intel/scan', async (req, res) => {
     let domainIntel: any = null;
     let emailIntel: any = null;
 
-    // Helper: IP metadata fetcher
+    // Helper: IP metadata fetcher powered by multi-provider GeoIP + RIPE BGP engine
     const fetchIpInfo = async (ipAddr: string) => {
-      sourcesAttributed.push('IPAPI & MaxMind GeoIP Engine');
-      let geo: any = {};
-      try {
-        const c = new AbortController();
-        const t = setTimeout(() => c.abort(), 4000);
-        const r = await fetch(`https://ipapi.co/${ipAddr}/json/`, { signal: c.signal });
-        clearTimeout(t);
-        if (r.ok) geo = await r.json();
-      } catch {}
-
-      let rDns: string[] = [];
-      try {
-        rDns = await dns.reverse(ipAddr);
+      const geo = await resolveDeepIpGeo(ipAddr);
+      sourcesAttributed.push(
+        geo.providersUsed.length > 0
+          ? `Multi-Source GeoIP (${geo.providersUsed.join(', ')})`
+          : 'Multi-Source GeoIP Engine'
+      );
+      if (geo.reverseDns.length > 0) {
         sourcesAttributed.push('Authoritative Reverse DNS (PTR)');
-      } catch {}
+      }
 
       // Port probe on critical services
       const portsToProbe = [21, 22, 25, 80, 443, 3306, 5432, 6379, 8080];
@@ -1341,8 +1670,17 @@ app.post('/api/intel/scan', async (req, res) => {
         remediations.push('Kunci port database (3306/5432/6379) menggunakan firewall (iptables/ufw/AWS SG) agar hanya bisa diakses via localhost atau internal VPN.');
       }
 
-      const isBogon = /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/.test(ipAddr);
-      if (isBogon) {
+      if (geo.securityFlags.isProxy) {
+        threatScore += 15;
+        vulnerabilities.push({
+          id: 'INTEL-PROXY-VPN',
+          title: 'Proxy / VPN / Anonymizer Exit IP Terdeteksi',
+          severity: 'LOW',
+          desc: 'Alamat IP teridentifikasi sebagai node proxy, VPN, atau layanan anonimisasi oleh telemetry GeoIP.'
+        });
+      }
+
+      if (geo.isBogon) {
         threatScore += 10;
         vulnerabilities.push({
           id: 'INFO-PRIVATE-IP',
@@ -1353,18 +1691,27 @@ app.post('/api/intel/scan', async (req, res) => {
       }
 
       return {
-        ip: ipAddr,
-        reverseDns: rDns,
-        city: geo.city || 'Unknown',
-        region: geo.region || 'Unknown',
-        country: geo.country_name || 'Unknown',
-        countryCode: geo.country_code || 'N/A',
-        asn: geo.asn || 'Unknown',
-        org: geo.org || 'ISP Network',
-        timezone: geo.timezone || 'UTC',
-        coordinates: geo.latitude && geo.longitude ? `${geo.latitude}, ${geo.longitude}` : undefined,
+        ip: geo.ip,
+        reverseDns: geo.reverseDns,
+        continent: geo.continent,
+        city: geo.city,
+        region: geo.region,
+        country: geo.country,
+        countryCode: geo.country_code,
+        postal: geo.postal,
+        asn: geo.asn,
+        isp: geo.isp,
+        org: geo.org,
+        bgpPrefix: geo.bgpPrefix,
+        timezone: geo.timezone,
+        coordinates: geo.coordinates,
+        osmUrl: geo.osmUrl,
+        networkType: geo.networkType,
+        securityFlags: geo.securityFlags,
+        consensus: geo.consensus,
+        providersUsed: geo.providersUsed,
         openPorts,
-        isHosting: (geo.org || '').toLowerCase().includes('cloud') || (geo.org || '').toLowerCase().includes('hosting') || (geo.org || '').toLowerCase().includes('digitalocean')
+        isHosting: geo.securityFlags.isHosting
       };
     };
 
@@ -3642,7 +3989,9 @@ async function startServer() {
   });
 }
 
-startServer().catch(err => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (process.env.ATRIX_CLI_EMBEDDED !== '1' && process.env.VERCEL !== '1') {
+  startServer().catch(err => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}

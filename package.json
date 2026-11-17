@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
+    "cli": "tsx cli.ts",
+    "build:cli": "esbuild cli.ts --bundle --platform=node --format=esm --external:vite --outfile=atrix-cli.mjs --banner:js=\"import { createRequire } from 'module'; const require = createRequire(import.meta.url);\"",
     "build": "vite build",
     "preview": "vite preview",
     "start": "tsx server.ts",

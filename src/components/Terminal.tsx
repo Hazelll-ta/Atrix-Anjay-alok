@@ -24,13 +24,22 @@ import { TerminalOutputLine, NeofetchInfo } from '../types/terminal';
 import * as cyberCmds from '../utils/cyberCommands';
 import { getBatteryTelemetry } from '../utils/cyberSecTools';
 
-export const ATRIX_LOGO_ASCII = `    _   _____ ____  _____ __  __
-   / \\ |_   _|  _ \\|_   _\\\\ \\/ /
-  / _ \\  | | | |_) | | |   \\  / 
- / ___ \\ | | |  _ <  | |   /  \\ 
-/_/   \\_\\|_| |_| \\_\\ |_| /_/\\_\\ 
-────────────────────────────────
-       A T R I X   O S`;
+export const ATRIX_LOGO_ASCII = `        :*:*@@:
+    :@@######*
+  :@############@
+ :###############*:
+ @##################*
+:##########*:***@###@
+ ###########@     :
+ *############@*
+  @##############:
+   @##############
+  *################:
+   :@@@@@@@@@@@@@@:
+ :**@@@@@@@@@@@@@@@*:
+######################
+──────────────────────
+     ATRIX TOOLS`;
 
 export const ARCH_TRIANGLE_ASCII = `          -\`
         .o+\`
@@ -1380,7 +1389,7 @@ rtt min/avg/max = ${data.min}/${data.avg}/${data.max} ms`);
   };
 
   const handleIp = async (target?: string) => {
-    addLine('output', target ? `Looking up IP & Geolocation intel for '${target}'...` : 'Detecting network configuration...');
+    addLine('output', target ? `Resolving multi-provider IP Geolocation & BGP intel for '${target}'...` : 'Detecting public network & multi-source GeoIP configuration...');
     try {
       const url = target ? `/api/ip?target=${encodeURIComponent(target)}` : '/api/ip';
       const res = await fetch(url);
@@ -1389,25 +1398,56 @@ rtt min/avg/max = ${data.min}/${data.avg}/${data.max} ms`);
         addLine('error', data.error || 'Failed to obtain IP details');
         return;
       }
+      const flags = data.securityFlags || {};
+      const flagTags = [
+        flags.isProxy ? 'PROXY/VPN[!]' : null,
+        flags.isHosting ? 'HOSTING/CLOUD' : null,
+        flags.isMobile ? 'MOBILE' : null,
+        flags.isAnycast ? 'ANYCAST/CDN' : null,
+        flags.isBogon ? 'PRIVATE/BOGON' : null
+      ].filter(Boolean);
+
       if (data.isRemoteTarget) {
-        let out = `IP Intelligence & Geolocation for ${data.ip} (${data.target || ''})
-──────────────────────────────────────────────────────────
-Country   : ${data.country} (${data.country_code})
-City/Reg  : ${data.city}, ${data.region}
-ASN / ISP : ${data.asn || 'N/A'} - ${data.org}
-Timezone  : ${data.timezone}
-Coords    : ${data.latitude && data.longitude ? `${data.latitude}, ${data.longitude}` : 'N/A'}`;
-        if (data.reverseDns && data.reverseDns.length > 0) {
-          out += `\nHostnames : ${data.reverseDns.join(', ')}`;
+        let out = `========================================================================
+              DEEP IP GEOLOCATION & NETWORK INTELLIGENCE
+========================================================================
+Target       : ${data.target || data.ip} -> ${data.ip} (${data.ipVersion || 'IPv4'})
+Country      : ${data.country} (${data.country_code}) [${data.continent || 'N/A'}]
+City/Region  : ${data.city}, ${data.region}${data.postal && data.postal !== 'N/A' ? ` (ZIP: ${data.postal})` : ''}
+Coordinates  : ${data.coordinates || 'N/A'}
+Timezone     : ${data.timezone}
+ASN / BGP    : ${data.asn || 'N/A'} | Prefix: ${data.bgpPrefix || 'N/A'}
+ISP / Org    : ${data.isp || data.org} (${data.org})
+Network Type : ${data.networkType || 'ISP'}${flagTags.length > 0 ? ` [${flagTags.join(', ')}]` : ''}
+Geo Consensus: ${data.consensus || 'Verified'}`;
+        if (data.resolvedAddresses && data.resolvedAddresses.length > 1) {
+          out += `\nAll DNS IPs  : ${data.resolvedAddresses.slice(0, 6).join(', ')}`;
         }
+        if (data.reverseDns && data.reverseDns.length > 0) {
+          out += `\nReverse DNS  : ${data.reverseDns.join(', ')}`;
+        }
+        if (data.osmUrl) {
+          out += `\nMap Link     : ${data.osmUrl}`;
+        }
+        if (data.providersUsed && data.providersUsed.length > 0) {
+          out += `\nSources (${data.providersUsed.length})  : ${data.providersUsed.join(' + ')}`;
+        }
+        out += `\n========================================================================`;
         addLine('output', out);
       } else {
-        addLine('output', `eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
-        inet ${data.ip}  netmask 255.255.255.0
-        Location : ${data.city}, ${data.region}, ${data.country} (${data.country_code})
-        ISP/Org  : ${data.org} (ASN: ${data.asn || 'N/A'})
-        Timezone : ${data.timezone}
-        UserAgent: ${data.userAgent}`);
+        let out = `eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
+        inet ${data.ip} (${data.ipVersion || 'IPv4'})  netmask 255.255.255.0
+        Location  : ${data.city}, ${data.region}, ${data.country} (${data.country_code}) [${data.continent || 'N/A'}]
+        Coords    : ${data.coordinates || 'N/A'}${data.osmUrl ? ` | ${data.osmUrl}` : ''}
+        ISP / Org : ${data.isp || data.org} (ASN: ${data.asn || 'N/A'} | Prefix: ${data.bgpPrefix || 'N/A'})
+        Net Type  : ${data.networkType || 'ISP'}${flagTags.length > 0 ? ` [${flagTags.join(', ')}]` : ''}
+        Timezone  : ${data.timezone}
+        Consensus : ${data.consensus || 'Verified'} (${data.providersUsed?.join(', ') || 'GeoIP'})`;
+        if (data.reverseDns && data.reverseDns.length > 0) {
+          out += `\n        PTR / rDNS: ${data.reverseDns.join(', ')}`;
+        }
+        out += `\n        UserAgent : ${data.userAgent}`;
+        addLine('output', out);
       }
     } catch (err: any) {
       addLine('error', `Failed to obtain IP details: ${err.message}`);
@@ -2328,7 +2368,7 @@ Total Installed Size:   4.85 MiB
                       {/* Logo on top */}
                       <pre
                         style={{ color: logoColor }}
-                        className="text-[12px] sm:text-[14px] leading-[1.2] font-bold select-text overflow-x-auto my-1"
+                        className="text-[11px] sm:text-[13px] leading-[1.1] font-bold select-text overflow-x-auto my-1"
                       >
                         {ATRIX_LOGO_ASCII}
                       </pre>
@@ -2374,7 +2414,7 @@ Total Installed Size:   4.85 MiB
                     <pre
                       key={line.id}
                       style={{ color: logoColor }}
-                      className="font-mono text-[12px] sm:text-[14px] leading-[1.2] my-1 font-semibold overflow-x-auto select-text"
+                      className="font-mono text-[11px] sm:text-[13px] leading-[1.1] my-1 font-bold overflow-x-auto select-text"
                     >
                       {ATRIX_LOGO_ASCII}
                     </pre>

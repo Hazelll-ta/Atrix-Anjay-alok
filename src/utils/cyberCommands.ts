@@ -2854,11 +2854,21 @@ Contoh Perintah:
     // 1. IP Network Section
     if (data.ipIntel) {
       const ip = data.ipIntel;
+      const flags = ip.securityFlags || {};
+      const flagTags = [
+        flags.isProxy ? 'PROXY/VPN[!]' : null,
+        flags.isHosting ? 'HOSTING/CLOUD' : null,
+        flags.isMobile ? 'MOBILE' : null,
+        flags.isAnycast ? 'ANYCAST/CDN' : null
+      ].filter(Boolean);
       out += `[1] IP & NETWORK INFRASTRUCTURE:
   • IP Address         : ${ip.ip}
   • Reverse DNS (PTR)  : ${ip.reverseDns?.join(', ') || 'None / No PTR configured'}
-  • ASN & Provider     : ${ip.asn} (${ip.org})
-  • Wilayah Geografis  : ${ip.city}, ${ip.region}, ${ip.country} (${ip.countryCode})
+  • ASN / BGP Prefix   : ${ip.asn} (${ip.org}) | Prefix: ${ip.bgpPrefix || 'N/A'}
+  • Network Class      : ${ip.networkType || 'ISP'}${flagTags.length > 0 ? ` [${flagTags.join(', ')}]` : ''}
+  • Wilayah Geografis  : ${ip.city}, ${ip.region}, ${ip.country} (${ip.countryCode})${ip.postal && ip.postal !== 'N/A' ? ` ZIP: ${ip.postal}` : ''}
+  • Koordinat & TZ     : ${ip.coordinates || 'N/A'} (${ip.timezone || 'UTC'})
+  • Geo Consensus      : ${ip.consensus || 'Verified'}
   • Open Ports Probed  : ${ip.openPorts?.length > 0 ? ip.openPorts.map((p: number) => `${p}/tcp`).join(', ') : 'None exposed in standard set'}\n\n`;
     }
 
@@ -2999,18 +3009,32 @@ Verdict      : ${data.verdict}
 
     if (data.httpInfo) {
       const h = data.httpInfo.securityHeaders;
+      const ca = data.httpInfo.cspAudit;
       out += `\n[3] HTTP RESPONSE & SECURITY HEADERS:\n`;
       out += `  HTTP Status: ${data.httpInfo.status} ${data.httpInfo.statusText || ''}\n`;
       out += `  Server     : ${data.httpInfo.server} | Type: ${data.httpInfo.contentType}\n`;
       out += `  Headers    : HSTS[${h.hasHsts ? '✓' : '✗'}]  CSP[${h.hasCsp ? '✓' : '✗'}]  XFO[${h.hasXfo ? '✓' : '✗'}]  XCTO[${h.hasXcto ? '✓' : '✗'}]\n`;
+      if (ca && ca.present) {
+        const flags = [
+          ca.unsafeInline ? 'unsafe-inline' : null,
+          ca.unsafeEval ? 'unsafe-eval' : null,
+          ca.wildcard ? 'wildcard(*)' : null
+        ].filter(Boolean);
+        out += `  CSP Audit  : ${flags.length > 0 ? `Lemah (${flags.join(', ')}) [!]` : 'Strict / Tidak ada unsafe-inline/eval [✓]'}\n`;
+      }
     }
 
     if (data.htmlAnalysis) {
       const ha = data.htmlAnalysis;
-      out += `\n[4] INSPEKSI KONTEN HTML:\n`;
+      const xs = ha.xssSurface;
+      out += `\n[4] INSPEKSI KONTEN HTML & INDIKATOR HTML INJECTION / XSS (PASIF):\n`;
       out += `  Page Title : ${ha.title}\n`;
       out += `  Input Pass : ${ha.hasPasswordField ? 'Ada form password' : 'Tidak ada'}\n`;
       out += `  Anomali    : HiddenIframe[${ha.hiddenIframe ? 'YA [!]' : 'Tidak'}] | ObfuscatedJS[${ha.obfuscatedJs ? 'YA [!]' : 'Tidak'}] | MetaRefresh[${ha.hasMetaRefresh ? 'YA' : 'Tidak'}]\n`;
+      if (xs) {
+        out += `  XSS Surface: InlineHandlers[${xs.inlineEventHandlers}] | JS-URI[${xs.jsPseudoUriCount}] | UnsandboxedIframe[${xs.unsandboxedIframes}]\n`;
+        out += `  DOM Sinks  : ${xs.domSinks && xs.domSinks.length > 0 ? `${xs.domSinks.join(', ')} [!]` : 'Tidak terdeteksi sink berisiko [✓]'}\n`;
+      }
       if (ha.externalFormAction) {
         out += `  Form Submit: Mengirim data ke domain luar -> ${ha.externalFormAction} [!]\n`;
       }

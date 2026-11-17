@@ -1,87 +1,45 @@
-# 🛡️ ATRIX OS - Cyber Security & OSINT Workstation
+# ATRIX OS — Cyber Security, OSINT & CLI Toolkit
 
-A browser-based Cyber Security & OSINT terminal operating system powered by React, Vite, Tailwind CSS, and an Express.js backend for real network intelligence.
-
----
-
-## 🚀 Fitur Unggulan
-* **OSINT & Reconnaissance**: `sherlock`, `gravatar`, `whois`, `subdomains`, `wayback`, `dork`, `email`, `phone`, `github`, `ghrepos`, `ghemail`.
-* **Network & Security Auditing**: `techstack` (Wappalyzer-lite), `info` (deep website purpose & utility analyzer), `emailsec` (SPF, DMARC, DKIM), `headers` (HSTS, CSP, X-Frame), `cors`, `ssl`, `portscan`, `cve`, `crack` (rainbow dictionary hash recovery).
-* **Linux Terminal Experience**: Virtual file system (`ls`, `cat`, `nano`, `grep`, `mkdir`, `rm`), Arch Linux aesthetic, neofetch system info, and customizable matrix theme.
+Workstation OSINT & Cyber Security real-time yang bisa dijalankan di **Vercel (Web 100% Gratis)**, **Termux CLI (Android)**, maupun **Server Node.js lokal/VPS**.
 
 ---
 
-## 💻 Cara Menjalankan di Lokal (PC / Laptop)
+## 1. Cara Deploy Gratis 100% ke Vercel (Tanpa Kartu Kredit)
 
-1. **Clone atau Extract ZIP project ini**:
-   ```bash
-   cd atrix-os
-   ```
-
-2. **Install dependencies**:
-   ```bash
-   npm install
-   ```
-
-3. **Buat file `.env`**:
-   Salin `.env.example` ke `.env`:
-   ```bash
-   cp .env.example .env
-   ```
-   *(Opsional) Isi `GEMINI_API_KEY` jika ingin fitur AI intelligence lebih pintar.*
-
-4. **Jalankan server development**:
-   ```bash
-   npm run dev
-   ```
-   Buka browser di: `http://localhost:3000`
-
-5. **Build untuk production**:
-   ```bash
-   npm run build
-   npm start
-   ```
+1. Upload seluruh file project ini ke repository **GitHub** (Private/Public).
+2. Buka **[vercel.com](https://vercel.com/)** -> Login dengan GitHub -> **Add New Project** -> pilih repo tadi.
+3. Konfigurasi otomatis terbaca dari `vercel.json` (`Build Command: npm run build`, `Output Directory: dist`).
+4. *(Opsional)* Tambahkan Environment Variable `GEMINI_API_KEY` jika ingin fitur `ai` & ringkasan cerdas aktif.
+5. Klik **Deploy** -> selesai! Semua fitur (`urlscan`, `intel`, `nmap`, `info`, `sqlmap`, `ssl`, `headers`, `whois`, `subdomains`, `sherlock`, `cve`, dll.) langsung aktif dengan HTTPS & bebas pasang custom domain gratis.
 
 ---
 
-## 🌐 Cara Deploy Gratis ke Render.com (Recommended)
+## 2. Cara Paling Cepat di Termux (Termasuk Termux Play Store — Tanpa `npm install`)
 
-1. Upload / Push folder project ini ke akun **GitHub** kamu.
-2. Buka dashboard [Render.com](https://dashboard.render.com/) dan login.
-3. Klik tombol **New +** -> pilih **Web Service**.
-4. Hubungkan ke repository GitHub kamu.
-5. Konfigurasi Service:
-   * **Name**: `atrix-os`
-   * **Runtime**: `Node`
-   * **Build Command**: `npm install && npm run build`
-   * **Start Command**: `npm start`
-6. *(Opsional)* Pada bagian **Environment Variables**, tambahkan:
-   * `NODE_ENV` = `production`
-   * `PORT` = `3000`
-   * `GEMINI_API_KEY` = (API key Gemini kamu dari Google AI Studio)
-7. Klik **Create Web Service**.
-8. Tunggu proses build selesai (sekitar 1-2 menit) -> Website ATRIX OS kamu sudah live dengan HTTPS gratis!
+File **`atrix-cli.mjs`** sudah dibundel menjadi 1 file JS mandiri tanpa butuh `node_modules` atau binary native:
 
----
-
-## ☁️ Cara Deploy ke Railway.app atau VPS Linux
-
-### Railway:
-1. Hubungkan GitHub repo ke [Railway.app](https://railway.app/).
-2. Railway akan otomatis mendeteksi Node.js.
-3. Masukkan Environment Variable `PORT=3000`.
-
-### VPS Ubuntu (DigitalOcean / IDCloudHost):
 ```bash
-git clone <repo-url>
-cd atrix-os
-npm install
-npm run build
-# Jalankan menggunakan PM2
-npm install -g pm2
-pm2 start "npm start" --name atrix-os
+pkg update && pkg install nodejs unzip -y
+termux-setup-storage
+
+unzip ~/storage/downloads/atrix-os-complete.zip -d ~/atrix-os
+cd ~/atrix-os
+
+node atrix-cli.mjs
 ```
-Setup Nginx reverse proxy ke port 3000 dan pasang Certbot SSL.
+
+Atau satu perintah langsung:
+```bash
+node atrix-cli.mjs urlscan https://example.com
+node atrix-cli.mjs intel 1.1.1.1
+```
 
 ---
-Dikembangkan untuk Whitehat & Ethical Security Enthusiasts.
+
+## 3. Mode Developer Lokal
+```bash
+npm install
+npm run cli       # Jalankan dari source cli.ts
+npm run build:cli # Rebuild atrix-cli.mjs
+npm run dev       # Jalankan web server (http://localhost:3000)
+```
